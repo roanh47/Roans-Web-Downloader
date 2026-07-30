@@ -24,6 +24,6 @@ python Roans-Web-Downloader.py
 
 ## Usage
 
-1. Paste a download URL
+1. Paste a download URL you definitely didn't get from your shady friend
 2. Choose a save folder (defaults to `Downloads`)
 3. Click **Download**
