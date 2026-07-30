@@ -27,7 +27,3 @@ python Roans-Web-Downloader.py
 1. Paste a download URL
 2. Choose a save folder (defaults to `Downloads`)
 3. Click **Download**
-
-## License
-
-MIT
