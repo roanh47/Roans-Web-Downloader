@@ -1,268 +1,262 @@
 #!/usr/bin/env python3
 """
-Roan's Web Downloader - Cross-platform downloader with resume, auto-retry,
-concurrent (multi-file) downloads and per-download priorities. Dark themed.
+AWESOME DOWNLOADER - the downloader, but it thinks it's a video game.
+
+Same core engine as Roan's Web Downloader (concurrent downloads, resume,
+auto-retry, priorities) wrapped in neon arcade animations, dubstep-ish
+chiptune, particle effects, screen shake, score/combo and easter eggs.
+
+Style inspired by "AwesomeCalculator" by deaen (video game calculator).
 
 Run with: python Roans-Web-Downloader.py
-No build required. Works on Windows, macOS, and Linux.
+No build required, zero external dependencies (stdlib only).
 """
 
 import os
+import math
 import time
+import random
+import struct
 import threading
 import urllib.request
 import urllib.error
 from pathlib import Path
 
-# --- GUI (tkinter is built into Python) ---
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox
 
-FONT = "Segoe UI"
+# ----------------------------------------------------------------------
+# Style constants
+# ----------------------------------------------------------------------
+FONT = "Consolas"
+TITLE_FONT = "Impact"
 
-# --- Dark palette ---
-BG = "#12141c"          # window background
-PANEL = "#1b1e29"       # cards / bars
-FIELD = "#252938"       # inputs, tree rows
-FIELD_ALT = "#2b3040"   # alternating tree rows
-FG = "#e6e6e6"
-FG_DIM = "#8b90a0"
-BORDER = "#333849"
-ACCENT = "#2f6df6"
-ACCENT_HOVER = "#4b83ff"
-ACCENT_PRESS = "#245ad0"
-GREEN = "#3ecf8e"
-RED = "#ff5f6d"
-YELLOW = "#f2c94c"
+BG = "#05010f"
+DARK = "#0b0620"
+CARD = "#10082a"
+FG = "#e8e8ff"
+FG_DIM = "#7d7aa8"
+BORDER = "#2a1b5e"
+
+NEON_PINK = "#ff2fd6"
+NEON_CYAN = "#22e6ff"
+NEON_GREEN = "#39ff88"
+NEON_YELLOW = "#ffe23a"
+NEON_PURPLE = "#a24bff"
+NEON_RED = "#ff3355"
+NEON_ORANGE = "#ff8a2b"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+PRIORITY_LABELS = {0: "HIGH", 1: "NORMAL", 2: "LOW"}
 
-PRIORITY_LABELS = {0: "High", 1: "Normal", 2: "Low"}
+CARD_H = 58
+CARD_GAP = 8
+QUEUE_TOP = 252
+QUEUE_BOTTOM = 610
+
+START_MUTED = False
 
 
 # ----------------------------------------------------------------------
-# Custom rounded button (drawn on a Canvas)
+# Audio (pure stdlib synth -> WAV in memory -> winsound)
 # ----------------------------------------------------------------------
-def _round_rect_points(x1, y1, x2, y2, r):
-    return [
-        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
-    ]
+RATE = 22050
 
 
-class RoundedButton(tk.Canvas):
-    def __init__(self, parent, text="", command=None, *, width=120, height=34,
-                 radius=9, surface=BG, fill=FIELD, hover=BORDER, fg=FG,
-                 font=None, accent=False):
-        super().__init__(parent, width=width, height=height, bg=surface,
-                         highlightthickness=0, bd=0, cursor="hand2")
-        self.command = command
-        self._bw, self._bh = width, height
-        self._radius = radius
-        self._text = text
-        self._font = font or (FONT, 10)
-        self._accent = accent
-        self._fg = "#ffffff" if accent else fg
-        self._base_fill = ACCENT if accent else fill
-        self._hover_fill = ACCENT_HOVER if accent else hover
-        self._enabled = True
-        self._selected = False
-        self._shape = None
-        self._label = None
+def _wav_bytes(samples):
+    frames = bytearray()
+    for s in samples:
+        v = int(max(-1.0, min(1.0, s)) * 32767)
+        frames += struct.pack("<h", v)
+    return (
+        b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, RATE, RATE * 2, 2, 16)
+        + b"data" + struct.pack("<I", len(frames)) + bytes(frames)
+    )
 
-        self._draw()
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<ButtonPress-1>", self._on_press)
-        self.bind("<ButtonRelease-1>", self._on_release)
-        self.bind("<Return>", lambda e: self._invoke())
-        self.bind("<space>", lambda e: self._invoke())
 
-    # -- drawing -------------------------------------------------------
-    def _draw(self):
-        self.delete("all")
-        points = _round_rect_points(1, 1, self._bw - 1, self._bh - 1, self._radius)
-        self._shape = self.create_polygon(
-            points, smooth=True, splinesteps=36, fill=self._fill(),
-            outline=BORDER, width=1,
-        )
-        self._label = self.create_text(
-            self._bw / 2, self._bh / 2 + 1, text=self._text,
-            fill=self._fg if self._enabled else FG_DIM, font=self._font,
-        )
+def _add_tone(buf, start, dur, freq, amp, wave="square", attack=0.005):
+    s0 = int(start * RATE)
+    s1 = min(len(buf), int((start + dur) * RATE))
+    for i in range(s0, s1):
+        t = (i - s0) / RATE
+        phase = freq * t
+        if wave == "square":
+            v = 1.0 if (phase % 1.0) < 0.5 else -1.0
+        elif wave == "saw":
+            v = 2.0 * (phase % 1.0) - 1.0
+        else:
+            v = math.sin(2 * math.pi * phase)
+        env = min(1.0, t / attack) * max(0.0, 1.0 - t / dur)
+        buf[i] += v * amp * env
 
-    def _fill(self):
-        if not self._enabled:
-            return PANEL
-        if self._selected:
-            return ACCENT
-        return self._base_fill
 
-    # -- events --------------------------------------------------------
-    def _on_enter(self, _):
-        if self._enabled:
-            self.itemconfig(
-                self._shape,
-                fill=ACCENT_HOVER if (self._accent or self._selected) else self._hover_fill,
+def _add_kick(buf, start):
+    dur = 0.18
+    s0 = int(start * RATE)
+    s1 = min(len(buf), int((start + dur) * RATE))
+    for i in range(s0, s1):
+        t = (i - s0) / RATE
+        f = 130 * math.exp(-t * 22) + 45
+        env = math.exp(-t * 12)
+        buf[i] += math.sin(2 * math.pi * f * t) * 0.85 * env
+
+
+def _add_noise(buf, start, dur, amp):
+    s0 = int(start * RATE)
+    s1 = min(len(buf), int((start + dur) * RATE))
+    for i in range(s0, s1):
+        t = (i - s0) / RATE
+        env = max(0.0, 1.0 - t / dur)
+        buf[i] += (random.random() * 2 - 1) * amp * env
+
+
+def build_music():
+    bpm = 150
+    beat = 60.0 / bpm
+    beats = 8
+    length = beat * beats
+    n = int(length * RATE)
+    buf = [0.0] * n
+
+    bass = [110.0, 110.0, 87.31, 87.31, 130.81, 130.81, 98.0, 98.0]
+    lead = [440.0, 523.25, 659.25, 523.25, 440.0, 392.0, 440.0, 523.25]
+
+    for b in range(beats):
+        t = b * beat
+        _add_kick(buf, t)
+        if b % 2 == 1:
+            _add_noise(buf, t, 0.12, 0.28)
+        else:
+            _add_noise(buf, t + beat / 2, 0.05, 0.12)
+        _add_tone(buf, t, beat * 0.95, bass[b], 0.32, "saw")
+        # wobble lead in 8th notes
+        for k in range(2):
+            t2 = t + k * beat / 2
+            f = lead[b] * (1.0 if k == 0 else 0.5)
+            _add_tone(buf, t2, beat / 2 * 0.9, f, 0.18, "square")
+        if b == 7:
+            _add_tone(buf, t + beat / 2, beat / 2, 880.0, 0.2, "square")
+
+    return _wav_bytes(buf)
+
+
+def build_sfx(kind):
+    if kind == "click":
+        buf = [0.0] * int(0.06 * RATE)
+        _add_tone(buf, 0, 0.06, 880, 0.5, "square")
+    elif kind == "add":
+        buf = [0.0] * int(0.18 * RATE)
+        _add_tone(buf, 0.0, 0.08, 660, 0.4, "square")
+        _add_tone(buf, 0.08, 0.10, 990, 0.4, "square")
+    elif kind == "error":
+        buf = [0.0] * int(0.30 * RATE)
+        _add_tone(buf, 0.0, 0.28, 130, 0.5, "saw")
+        _add_tone(buf, 0.0, 0.28, 98, 0.4, "square")
+    elif kind == "complete":
+        buf = [0.0] * int(0.55 * RATE)
+        for i, f in enumerate((523.25, 659.25, 783.99, 1046.5)):
+            _add_tone(buf, i * 0.10, 0.30, f, 0.38, "square")
+    elif kind == "jumpscare":
+        buf = [0.0] * int(0.7 * RATE)
+        _add_noise(buf, 0, 0.7, 0.5)
+        _add_tone(buf, 0, 0.7, 55, 0.6, "saw")
+        _add_tone(buf, 0, 0.7, 58, 0.5, "square")
+    else:
+        buf = [0.0] * int(0.05 * RATE)
+        _add_tone(buf, 0, 0.05, 440, 0.3, "square")
+    return _wav_bytes(buf)
+
+
+class Audio:
+    """Background music loop + sound effects, best-effort on Windows."""
+
+    def __init__(self):
+        self.enabled = True
+        self.playing = False
+        self._winsound = None
+        self._music = None
+        self._sfx = {}
+        try:
+            import winsound
+            self._winsound = winsound
+        except Exception:
+            self._winsound = None
+        if self._winsound is not None:
+            try:
+                self._music = build_music()
+                for name in ("click", "add", "error", "complete", "jumpscare"):
+                    self._sfx[name] = build_sfx(name)
+            except Exception:
+                self._music = None
+
+    def start_music(self):
+        if self._winsound is None or self._music is None:
+            return
+        try:
+            self._winsound.PlaySound(
+                self._music,
+                self._winsound.SND_MEMORY
+                | self._winsound.SND_ASYNC
+                | self._winsound.SND_LOOP,
             )
+            self.playing = True
+        except Exception:
+            pass
 
-    def _on_leave(self, _):
-        self.itemconfig(self._shape, fill=self._fill())
+    def stop_music(self):
+        if self._winsound is None:
+            return
+        try:
+            self._winsound.PlaySound(None, 0)
+        except Exception:
+            pass
+        self.playing = False
 
-    def _on_press(self, _):
-        if self._enabled:
-            self.itemconfig(
-                self._shape,
-                fill=ACCENT_PRESS if (self._accent or self._selected) else PANEL,
+    def toggle_music(self):
+        if self.playing:
+            self.stop_music()
+        else:
+            self.enabled = True
+            self.start_music()
+        return self.playing
+
+    def sfx(self, name):
+        if not self.enabled or self._winsound is None:
+            return
+        data = self._sfx.get(name)
+        if data is None:
+            return
+        try:
+            self._winsound.PlaySound(
+                data, self._winsound.SND_MEMORY | self._winsound.SND_ASYNC
             )
-
-    def _on_release(self, _):
-        if self._enabled:
-            self.itemconfig(self._shape, fill=self._fill())
-            self._invoke()
-
-    def _invoke(self):
-        if self._enabled and self.command:
-            self.command()
-
-    # -- public API ----------------------------------------------------
-    def set_selected(self, flag):
-        self._selected = bool(flag)
-        if self._shape and self._label:
-            self.itemconfig(self._shape, fill=self._fill())
-            self.itemconfig(self._label, fill="#ffffff" if flag else self._fg)
-
-    def set_state(self, enabled):
-        self._enabled = bool(enabled)
-        self.configure(cursor="hand2" if self._enabled else "")
-        if self._shape and self._label:
-            self.itemconfig(self._shape, fill=self._fill())
-            self.itemconfig(
-                self._label, fill=self._fg if self._enabled else FG_DIM
-            )
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------
-# Rounded input surfaces (a rounded background with a borderless widget)
-# ----------------------------------------------------------------------
-class _RoundedSurface(tk.Frame):
-    """A frame that paints a rounded rectangle behind a child widget."""
-
-    def __init__(self, parent, *, surface=BG, fill=FIELD, radius=9,
-                 height=36, outline=BORDER):
-        super().__init__(parent, bg=surface, height=height)
-        self.pack_propagate(False)
-        self._radius = radius
-        self._fill = fill
-        self._surface = surface
-        self._outline = outline
-        self._item = None
-        self.canvas = tk.Canvas(
-            self, bg=surface, highlightthickness=0, bd=0, takefocus=0
-        )
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Configure>", self._on_configure)
-
-    def _on_configure(self, event):
-        self.canvas.delete("bg")
-        points = _round_rect_points(
-            1, 1, event.width - 1, event.height - 1, self._radius
-        )
-        self._item = self.canvas.create_polygon(
-            points, smooth=True, splinesteps=36, fill=self._fill,
-            outline=self._outline, width=1, tags="bg",
-        )
-        self.canvas.tag_lower("bg")
-        self._layout(event.width, event.height)
-
-    def _layout(self, width, height):
-        pass
-
-    def set_outline(self, color):
-        self._outline = color
-        if self._item is not None:
-            self.canvas.itemconfig(self._item, outline=color)
-
-
-class RoundedEntry(_RoundedSurface):
-    def __init__(self, parent, textvariable=None, *, height=34, surface=BG,
-                 fill=FIELD, fg=FG, font=None, radius=9):
-        super().__init__(
-            parent, surface=surface, fill=fill, radius=radius, height=height
-        )
-        self.entry = tk.Entry(
-            self.canvas, textvariable=textvariable, bd=0, relief="flat",
-            bg=fill, fg=fg, insertbackground=ACCENT, selectbackground=ACCENT,
-            selectforeground="#ffffff", font=font or (FONT, 10),
-            highlightthickness=0,
-        )
-        self.entry.bind("<FocusIn>", lambda e: self.set_outline(ACCENT))
-        self.entry.bind("<FocusOut>", lambda e: self.set_outline(BORDER))
-
-    def _layout(self, width, height):
-        self.entry.place(
-            in_=self.canvas, x=12, y=6, relwidth=1.0, width=-24,
-            height=height - 12,
-        )
-
-
-class RoundedText(_RoundedSurface):
-    def __init__(self, parent, *, height=76, surface=PANEL, fill=FIELD, fg=FG,
-                 font=None, radius=10):
-        super().__init__(
-            parent, surface=surface, fill=fill, radius=radius, height=height
-        )
-        self.text = tk.Text(
-            self.canvas, bd=0, relief="flat", bg=fill, fg=fg,
-            insertbackground=ACCENT, selectbackground=ACCENT,
-            selectforeground="#ffffff", font=font or (FONT, 10), wrap="none",
-            undo=True, highlightthickness=0, padx=8, pady=6,
-        )
-        self.text.bind("<FocusIn>", lambda e: self.set_outline(ACCENT))
-        self.text.bind("<FocusOut>", lambda e: self.set_outline(BORDER))
-
-    def _layout(self, width, height):
-        self.text.place(
-            in_=self.canvas, x=3, y=3, relwidth=1.0, width=-6, height=height - 6
-        )
-
-
-# ----------------------------------------------------------------------
-# Data model
+# Core data model + download manager (same engine as the "boring" build)
 # ----------------------------------------------------------------------
 class DownloadTask:
-    """A single queued download."""
-
     def __init__(self, url, folder, output_path):
         self.url = url
         self.folder = folder
         self.output_path = output_path
         self.filename = os.path.basename(output_path)
-
-        # Machine + human state
-        self.state = "queued"  # queued|downloading|complete|failed|cancelled
+        self.state = "queued"
         self.status = "Queued"
-
-        # Progress
         self.downloaded = 0
         self.total = 0
         self.speed = 0
         self.eta = 0
-
-        # Control
         self.cancel_flag = False
         self.retry_count = 0
         self.probed_name = False
         self.item_id = None
-
-        # Priority: 0 = High, 1 = Normal, 2 = Low
         self.priority = 1
 
 
-# ----------------------------------------------------------------------
-# Download manager (runs downloads in background threads)
-# ----------------------------------------------------------------------
 class DownloadManager:
     def __init__(self, app, max_retries=10):
         self.app = app
@@ -274,7 +268,6 @@ class DownloadManager:
         self.running = False
         self.lock = threading.Lock()
 
-    # -- queue control -------------------------------------------------
     def add(self, task):
         with self.lock:
             self.tasks.append(task)
@@ -329,24 +322,16 @@ class DownloadManager:
         self.app.root.after(0, self.app._refresh_all_rows)
 
     def _reorder_pending(self):
-        """Restore pending order to match the queue order (lock held)."""
         order = {id(t): i for i, t in enumerate(self.tasks)}
         self.pending.sort(key=lambda t: order.get(id(t), 0))
 
     def _forget(self, iid):
-        try:
-            if self.app.tree.exists(iid):
-                self.app.tree.delete(iid)
-        except Exception:
-            pass
-        self.app.tasks_by_iid.pop(iid, None)
+        self.app._delete_row(iid)
 
-    # -- scheduling ----------------------------------------------------
     def _scheduler(self):
         while True:
             with self.lock:
                 while self.pending and len(self.active) < self.max_concurrent:
-                    # Highest priority first; ties keep queue order (stable).
                     self.pending.sort(key=lambda t: t.priority)
                     task = self.pending.pop(0)
                     self.active.add(task)
@@ -366,7 +351,6 @@ class DownloadManager:
             with self.lock:
                 self.active.discard(task)
 
-    # -- retry loop ----------------------------------------------------
     def _download_task(self, task):
         if task.state == "cancelled":
             return
@@ -374,7 +358,6 @@ class DownloadManager:
         task.status = "Starting..."
         task.speed = 0
         task.eta = 0
-        self.app.root.after(0, lambda: self.app._refresh_row(task))
 
         while task.retry_count <= self.max_retries and not task.cancel_flag:
             try:
@@ -386,7 +369,7 @@ class DownloadManager:
                         task.speed = 0
                         task.eta = 0
                         task.downloaded = task.total or task.downloaded
-                        self.app.root.after(0, lambda: self.app._refresh_row(task))
+                        self.app.root.after(0, lambda t=task: self.app._on_complete(t))
                     return
                 if partial:
                     raise ConnectionError("Download interrupted")
@@ -398,13 +381,10 @@ class DownloadManager:
                     task.state = "failed"
                     task.status = f"Failed: {e}"
                     task.speed = 0
-                    self.app.root.after(0, lambda: self.app._refresh_row(task))
+                    self.app.root.after(0, lambda: self.app.audio.sfx("error"))
                     return
                 wait = min(2 ** (task.retry_count - 1), 60)
-                task.status = (
-                    f"Retry {task.retry_count}/{self.max_retries} in {wait}s"
-                )
-                self.app.root.after(0, lambda: self.app._refresh_row(task))
+                task.status = f"Retry {task.retry_count}/{self.max_retries} in {wait}s"
                 for _ in range(int(wait * 10)):
                     if task.cancel_flag:
                         break
@@ -414,21 +394,9 @@ class DownloadManager:
             task.state = "cancelled"
             task.status = "Cancelled"
             task.speed = 0
-            self.app.root.after(0, lambda: self.app._refresh_row(task))
 
-    # -- actual transfer ----------------------------------------------
     def _do_download(self, task):
-        """
-        Download one task with resume support using urllib.
-
-        Returns (success, partial):
-          - (True, False)  -> finished cleanly
-          - (False, True)  -> connection dropped (file kept for resume)
-          - raises on hard errors (DNS, 404, etc.)
-        """
         url = task.url
-
-        # --- Probe server: total size + Range support + real filename ---
         remote_size = 0
         accepts_ranges = False
         cd_name = None
@@ -459,7 +427,6 @@ class DownloadManager:
                 remote_size = 0
                 accepts_ranges = False
 
-        # --- Adopt the server-provided filename (once) ---
         if cd_name and not task.probed_name:
             task.probed_name = True
             if cd_name != task.filename:
@@ -502,7 +469,7 @@ class DownloadManager:
             task.total = total
             task.downloaded = downloaded
 
-            block_size = 1024 * 64  # 64 KiB
+            block_size = 1024 * 64
             start_time = time.monotonic()
             last_progress = 0.0
 
@@ -537,9 +504,6 @@ class DownloadManager:
                             if task.eta <= 0
                             else f"ETA {self.app._fmt_time(task.eta)}"
                         )
-                        self.app.root.after(
-                            0, lambda t=task: self.app._refresh_row(t)
-                        )
 
                 if task.cancel_flag:
                     return (False, True)
@@ -551,7 +515,6 @@ class DownloadManager:
 
     @staticmethod
     def _name_from_headers(headers):
-        """Extract a filename from a Content-Disposition header, if present."""
         cd = headers.get("Content-Disposition", "")
         if not cd:
             return None
@@ -571,291 +534,224 @@ class DownloadManager:
 
 
 # ----------------------------------------------------------------------
-# GUI
+# Neon arcade button drawn on the stage canvas
 # ----------------------------------------------------------------------
-class DownloaderApp:
+class ArcadeButton:
+    def __init__(self, app, x, y, w, h, text, command, color=NEON_CYAN,
+                 font_size=11, accent=False):
+        self.app = app
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.text = text
+        self.command = command
+        self.color = color
+        self.accent = accent
+        self.disabled = False
+        self.hover = False
+        c = app.stage
+        self.tag = f"btn{id(self)}"
+        fill = color if accent else DARK
+        self.body = c.create_rectangle(
+            x, y, x + w, y + h, outline=color, width=3, fill=fill,
+            tags=("ui", self.tag),
+        )
+        self.label = c.create_text(
+            x + w / 2, y + h / 2, text=text, fill=(BG if accent else color),
+            font=(FONT, font_size, "bold"), tags=("ui", self.tag),
+        )
+        self.glow = c.create_rectangle(
+            x - 4, y - 4, x + w + 4, y + h + 4, outline=color, width=1,
+            dash=(2, 6), tags=("ui", self.tag),
+        )
+
+    def contains(self, px, py):
+        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
+
+    def set_text(self, text):
+        self.app.stage.itemconfig(self.label, text=text)
+
+    def press(self):
+        if self.disabled:
+            return
+        c = self.app.stage
+        c.itemconfig(self.body, fill=self.color)
+        c.itemconfig(self.label, fill=BG)
+        self.app.audio.sfx("click")
+
+    def release(self):
+        c = self.app.stage
+        c.itemconfig(self.body, fill=(self.color if self.accent else DARK))
+        c.itemconfig(self.label, fill=(BG if self.accent else self.color))
+
+    def invoke(self):
+        if not self.disabled and self.command:
+            self.command()
+
+
+# ----------------------------------------------------------------------
+# The game
+# ----------------------------------------------------------------------
+class AwesomeDownloader:
     def __init__(self, root):
         self.root = root
-        self.root.title("Roan's Web Downloader")
-        self.root.geometry("940x640")
-        self.root.minsize(780, 520)
+        self.root.title("AWESOME DOWNLOADER")
+        self.root.geometry("1024x720+80+40")
+        self.root.resizable(False, False)
         self.root.configure(bg=BG)
 
         self.manager = DownloadManager(self)
         self.tasks_by_iid = {}
-        self.priority_buttons = {}
+        self._next_iid = 0
+        self.selected = set()
+        self.scroll = 0
+        self.popups = []
+        self.particles = []
+        self.buttons = []
+        self.card_rects = []
+        self.title_hue = 0.0
+        self.shake_until = 0.0
+        self.scare_until = 0.0
+        self.cantaloupe_until = 0.0
+        self.combo = 0
+        self.score = 0
+        self.last_event = time.time()
+        self.audio = Audio() if not START_MUTED else _muted_audio()
 
-        self._apply_theme()
-        self._build_ui()
-        self._enable_dark_titlebar()
+        self.stars = [
+            [random.uniform(0, 1024), random.uniform(0, 720),
+             random.uniform(0.3, 1.6), random.choice((NEON_CYAN, NEON_PINK, FG))]
+            for _ in range(70)
+        ]
 
+        self.stage = tk.Canvas(
+            self.root, width=1024, height=720, bg=BG, highlightthickness=0
+        )
+        self.stage.pack(fill=tk.BOTH, expand=True)
+
+        self._build()
+        self.audio.start_music()
+        self._bind_events()
+        self._tick()
+
+    # -- construction --------------------------------------------------
+    def _build(self):
+        c = self.stage
+
+        # URL entry (embedded widget)
+        self.url_var = tk.StringVar()
+        self.url_entry = tk.Entry(
+            c, textvariable=self.url_var, bg=DARK, fg=NEON_CYAN,
+            insertbackground=NEON_PINK, relief="flat", font=(FONT, 12),
+            highlightthickness=0,
+        )
+        c.create_window(38, 150, window=self.url_entry, anchor="nw",
+                        width=700, height=30, tags=("widgets",))
+        self.url_entry.bind("<Return>", lambda e: self._add_urls())
+
+        # Folder entry (embedded widget)
+        self.folder_var = tk.StringVar(value=str(Path.home() / "Downloads"))
+        self.folder_entry = tk.Entry(
+            c, textvariable=self.folder_var, bg=DARK, fg=NEON_GREEN,
+            insertbackground=NEON_PINK, relief="flat", font=(FONT, 10),
+            highlightthickness=0,
+        )
+        c.create_window(140, 630, window=self.folder_entry, anchor="nw",
+                        width=450, height=24, tags=("widgets",))
+
+        # Buttons
+        self.buttons = [
+            ArcadeButton(self, 776, 140, 110, 48, "ADD!",
+                         self._add_urls, NEON_PINK, 14, accent=True),
+            ArcadeButton(self, 896, 140, 112, 48, "MUSIC ON",
+                         self._toggle_music, NEON_YELLOW, 10),
+            ArcadeButton(self, 610, 620, 110, 38, "BROWSE",
+                         self._pick_folder, NEON_GREEN, 10),
+        ]
+        # queue toolbar
+        self.buttons += [
+            ArcadeButton(self, 600, 204, 44, 28, "UP",
+                         lambda: self._move_selected(-1), NEON_CYAN, 10),
+            ArcadeButton(self, 650, 204, 54, 28, "DOWN",
+                         lambda: self._move_selected(1), NEON_CYAN, 10),
+            ArcadeButton(self, 782, 204, 56, 28, "HIGH",
+                         lambda: self._set_priority(0), NEON_RED, 10),
+            ArcadeButton(self, 844, 204, 64, 28, "NORM",
+                         lambda: self._set_priority(1), NEON_YELLOW, 10),
+            ArcadeButton(self, 914, 204, 54, 28, "LOW",
+                         lambda: self._set_priority(2), NEON_GREEN, 10),
+        ]
+        # concurrent stepper
+        self.minus_btn = ArcadeButton(self, 150, 668, 34, 30, "-",
+                                      self._dec_concurrent, NEON_PURPLE, 14)
+        self.plus_btn = ArcadeButton(self, 216, 668, 34, 30, "+",
+                                     self._inc_concurrent, NEON_PURPLE, 14)
+        self.buttons += [self.minus_btn, self.plus_btn]
+        # bottom actions
+        self.buttons += [
+            ArcadeButton(self, 300, 666, 100, 34, "REMOVE",
+                         self._remove_selected, NEON_CYAN, 10),
+            ArcadeButton(self, 410, 666, 130, 34, "CLEAR DONE",
+                         self.manager.clear_finished, NEON_CYAN, 10),
+            ArcadeButton(self, 550, 666, 120, 34, "CANCEL ALL",
+                         self.manager.cancel_all, NEON_ORANGE, 10),
+            ArcadeButton(self, 790, 662, 214, 42, "START!",
+                         self.manager.start_all, NEON_GREEN, 16, accent=True),
+        ]
+        self.music_btn = self.buttons[1]
+
+    def _bind_events(self):
+        self.stage.bind("<Button-1>", self._on_press)
+        self.stage.bind("<ButtonRelease-1>", self._on_release)
+        self.stage.bind("<Motion>", self._on_motion)
+        self.stage.bind("<MouseWheel>", self._on_wheel)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ------------------------------------------------------------------
-    # Theme
-    # ------------------------------------------------------------------
-    def _apply_theme(self):
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        style.configure(
-            "Treeview", background=FIELD, fieldbackground=FIELD, foreground=FG,
-            bordercolor=BG, borderwidth=0, relief="flat", rowheight=34,
-            lightcolor=FIELD, darkcolor=FIELD, font=(FONT, 10),
-        )
-        style.map(
-            "Treeview",
-            background=[("selected", ACCENT)],
-            foreground=[("selected", "#ffffff")],
-        )
-        style.configure(
-            "Treeview.Heading", background=PANEL, foreground=FG_DIM,
-            relief="flat", borderwidth=0, padding=(8, 8),
-            font=(FONT, 9, "bold"),
-        )
-        style.map("Treeview.Heading", background=[("active", FIELD_ALT)])
-
-        style.configure(
-            "Vertical.TScrollbar", background=BORDER, troughcolor=BG,
-            bordercolor=BG, arrowcolor=FG_DIM, relief="flat",
-            darkcolor=BORDER, lightcolor=BORDER, arrowsize=14,
-        )
-        style.map(
-            "Vertical.TScrollbar",
-            background=[("active", ACCENT), ("pressed", ACCENT_PRESS)],
-        )
-
-    def _enable_dark_titlebar(self):
-        """Ask Windows to draw a dark title bar (best effort)."""
-        if os.name != "nt":
-            return
-        try:
-            import ctypes
-
-            self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            value = ctypes.c_int(1)
-            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
-                )
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
-    def _build_ui(self):
-        main = tk.Frame(self.root, bg=BG)
-        main.pack(fill=tk.BOTH, expand=True, padx=18, pady=(14, 12))
-        main.columnconfigure(0, weight=1)
-        main.rowconfigure(3, weight=1)
-
-        self._build_header(main, row=0)
-        self._build_input_card(main, row=1)
-        self._build_queue_header(main, row=2)
-        self._build_tree(main, row=3)
-        self._build_bottom_bar(main, row=4)
-        self._build_status_bar(main, row=5)
-
-    def _build_header(self, parent, row):
-        header = tk.Frame(parent, bg=BG)
-        header.grid(row=row, column=0, sticky=tk.EW)
-        tk.Label(
-            header, text="Roan's Web Downloader", bg=BG, fg="#ffffff",
-            font=(FONT, 18, "bold"),
-        ).pack(anchor="w")
-        tk.Label(
-            header,
-            text="Concurrent downloads  ·  resume  ·  auto-retry  ·  priorities",
-            bg=BG, fg=FG_DIM, font=(FONT, 9),
-        ).pack(anchor="w", pady=(2, 0))
-        tk.Frame(header, bg=ACCENT, height=2).pack(fill="x", pady=(10, 0))
-
-    def _build_input_card(self, parent, row):
-        card = tk.Frame(parent, bg=PANEL)
-        card.grid(row=row, column=0, sticky=tk.EW, pady=(14, 0))
-        card.columnconfigure(0, weight=1)
-
-        inner = tk.Frame(card, bg=PANEL)
-        inner.grid(row=0, column=0, sticky=tk.EW, padx=14, pady=12)
-        inner.columnconfigure(0, weight=1)
-
-        tk.Label(
-            inner, text="ADD URLS   (one per line)", bg=PANEL, fg=FG_DIM,
-            font=(FONT, 8, "bold"),
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
-
-        url_box = RoundedText(inner, height=78, surface=PANEL)
-        url_box.grid(row=1, column=0, sticky=tk.EW, pady=(6, 0))
-        self.url_text = url_box.text
-        self.url_text.bind("<Return>", self._on_url_return)
-
-        RoundedButton(
-            inner, text="Add to Queue", command=self._add_urls, width=140,
-            height=78, radius=10, surface=PANEL, accent=True,
-            font=(FONT, 10, "bold"),
-        ).grid(row=1, column=1, sticky=tk.N, padx=(10, 0), pady=(6, 0))
-
-    def _build_queue_header(self, parent, row):
-        qh = tk.Frame(parent, bg=BG)
-        qh.grid(row=row, column=0, sticky=tk.EW, pady=(16, 6))
-        qh.columnconfigure(0, weight=1)
-
-        tk.Label(
-            qh, text="QUEUE", bg=BG, fg=FG_DIM, font=(FONT, 8, "bold")
-        ).grid(row=0, column=0, sticky="w")
-
-        RoundedButton(
-            qh, text="↑", command=lambda: self._move_selected(-1), width=38,
-            height=30, radius=8, surface=BG, font=(FONT, 12),
-        ).grid(row=0, column=1, padx=(0, 4))
-        RoundedButton(
-            qh, text="↓", command=lambda: self._move_selected(1), width=38,
-            height=30, radius=8, surface=BG, font=(FONT, 12),
-        ).grid(row=0, column=2, padx=(0, 12))
-        tk.Label(
-            qh, text="Priority:", bg=BG, fg=FG_DIM, font=(FONT, 9)
-        ).grid(row=0, column=3, padx=(0, 6))
-
-        for col, (text, value) in enumerate(
-            (("High", 0), ("Normal", 1), ("Low", 2)), start=4
-        ):
-            btn = RoundedButton(
-                qh, text=text, command=lambda v=value: self._set_priority(v),
-                width=66, height=30, radius=8, surface=BG, font=(FONT, 9),
-            )
-            btn.grid(row=0, column=col, padx=(0, 5))
-            self.priority_buttons[value] = btn
-
-    def _build_tree(self, parent, row):
-        frame = tk.Frame(parent, bg=BG)
-        frame.grid(row=row, column=0, sticky=tk.NSEW)
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
-
-        columns = ("priority", "name", "size", "progress", "speed", "status")
-        self.tree = ttk.Treeview(
-            frame, columns=columns, show="headings", selectmode="extended"
-        )
-        headings = {
-            "priority": ("Priority", 78),
-            "name": ("File", 230),
-            "size": ("Size", 150),
-            "progress": ("Progress", 175),
-            "speed": ("Speed", 90),
-            "status": ("Status", 150),
-        }
-        for col, (text, width) in headings.items():
-            self.tree.heading(col, text=text, anchor=tk.W)
-            self.tree.column(col, width=width, anchor=tk.W, stretch=col == "name")
-        self.tree.grid(row=0, column=0, sticky=tk.NSEW)
-
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
-        vsb.grid(row=0, column=1, sticky=tk.NS)
-        self.tree.configure(yscrollcommand=vsb.set)
-
-        self.tree.tag_configure("queued", foreground=FG_DIM)
-        self.tree.tag_configure("downloading", foreground=FG)
-        self.tree.tag_configure("complete", foreground=GREEN)
-        self.tree.tag_configure("failed", foreground=RED)
-        self.tree.tag_configure("cancelled", foreground=YELLOW)
-        self.tree.tag_configure("band0", background=FIELD)
-        self.tree.tag_configure("band1", background=FIELD_ALT)
-
-        self.tree.bind("<<TreeviewSelect>>", self._update_priority_controls)
-
-    def _build_bottom_bar(self, parent, row):
-        bar = tk.Frame(parent, bg=PANEL)
-        bar.grid(row=row, column=0, sticky=tk.EW, pady=(14, 0))
-
-        inner = tk.Frame(bar, bg=PANEL)
-        inner.pack(fill="x", padx=14, pady=12)
-
-        # --- Save-to row: label | rounded entry (expands) | Browse ---
-        folder_row = tk.Frame(inner, bg=PANEL)
-        folder_row.pack(fill="x")
-        tk.Label(
-            folder_row, text="Save to", bg=PANEL, fg=FG_DIM, font=(FONT, 9)
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        RoundedButton(
-            folder_row, text="Browse…", command=self._pick_folder, width=94,
-            height=34, radius=9, surface=PANEL,
-        ).pack(side=tk.RIGHT, padx=(8, 0))
-        self.folder_var = tk.StringVar(value=str(Path.home() / "Downloads"))
-        self.folder_entry = RoundedEntry(
-            folder_row, textvariable=self.folder_var, height=34, surface=PANEL
-        )
-        self.folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # --- Controls row: Concurrent stepper (left) | actions (right) ---
-        ctrl_row = tk.Frame(inner, bg=PANEL)
-        ctrl_row.pack(fill="x", pady=(12, 0))
-
-        tk.Label(
-            ctrl_row, text="Concurrent", bg=PANEL, fg=FG_DIM, font=(FONT, 9)
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        RoundedButton(
-            ctrl_row, text="−", command=self._dec_concurrent, width=32,
-            height=30, radius=8, surface=PANEL, font=(FONT, 13),
-        ).pack(side=tk.LEFT)
-        self.concurrent_label = tk.Label(
-            ctrl_row, text=str(self.manager.max_concurrent), bg=PANEL, fg=FG,
-            font=(FONT, 11, "bold"), width=3,
-        )
-        self.concurrent_label.pack(side=tk.LEFT)
-        RoundedButton(
-            ctrl_row, text="+", command=self._inc_concurrent, width=32,
-            height=30, radius=8, surface=PANEL, font=(FONT, 13),
-        ).pack(side=tk.LEFT)
-
-        RoundedButton(
-            ctrl_row, text="Start downloads", command=self.manager.start_all,
-            width=150, height=32, radius=8, surface=PANEL, accent=True,
-            font=(FONT, 10, "bold"),
-        ).pack(side=tk.RIGHT)
-        RoundedButton(
-            ctrl_row, text="Cancel all", command=self.manager.cancel_all,
-            width=96, height=32, radius=8, surface=PANEL,
-        ).pack(side=tk.RIGHT, padx=(0, 6))
-        RoundedButton(
-            ctrl_row, text="Clear finished", command=self.manager.clear_finished,
-            width=116, height=32, radius=8, surface=PANEL,
-        ).pack(side=tk.RIGHT, padx=(0, 6))
-        RoundedButton(
-            ctrl_row, text="Remove", command=self._remove_selected, width=84,
-            height=32, radius=8, surface=PANEL,
-        ).pack(side=tk.RIGHT, padx=(0, 6))
-
-    def _build_status_bar(self, parent, row):
-        bar = tk.Frame(parent, bg=BG)
-        bar.grid(row=row, column=0, sticky=tk.EW, pady=(10, 0))
-        self.status_dot = tk.Canvas(
-            bar, width=10, height=10, bg=BG, highlightthickness=0
-        )
-        self.status_dot.pack(side=tk.LEFT, pady=2)
-        self._dot = self.status_dot.create_oval(1, 1, 9, 9, fill=FG_DIM, outline="")
-        self.status_var = tk.StringVar(value="Ready.")
-        tk.Label(
-            bar, textvariable=self.status_var, bg=BG, fg=FG_DIM, font=(FONT, 9)
-        ).pack(side=tk.LEFT, padx=(8, 0))
-
-    # ------------------------------------------------------------------
-    # Helpers / callbacks
-    # ------------------------------------------------------------------
-    def _on_url_return(self, event):
-        self._add_urls()
-        return "break"
-
+    # -- input ---------------------------------------------------------
     def _pick_folder(self):
         path = filedialog.askdirectory(
             title="Choose download folder", initialdir=self.folder_var.get()
         )
         if path:
             self.folder_var.set(path)
+
+    def _add_urls(self):
+        folder = self.folder_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            self.audio.sfx("error")
+            self._popup(512, 360, "PICK A REAL FOLDER!", NEON_RED)
+            return
+        raw = self.url_var.get()
+        if "9+10" in raw:
+            self._popup(512, 360, "9 + 10 = 21", NEON_YELLOW)
+            self.score += 21
+        urls = [u.strip() for u in raw.replace(",", " ").split() if u.strip()]
+        if not urls:
+            self.audio.sfx("error")
+            self._popup(512, 360, "WHERE'S THE URL??", NEON_RED)
+            return
+        added = 0
+        for url in urls:
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            filename = self._extract_filename(url) or "download"
+            output_path = self._unique_output_path(folder, filename)
+            task = DownloadTask(url, folder, output_path)
+            task.item_id = self._next_iid
+            self._next_iid += 1
+            self.manager.add(task)
+            self.tasks_by_iid[task.item_id] = task
+            self._popup(512, 360, "ADDED TO THE QUEUE!", NEON_CYAN)
+            added += 1
+        if added:
+            self.url_var.set("")
+            self.audio.sfx("add")
+            self.score += added * 10
+        else:
+            self.audio.sfx("error")
+            self._popup(512, 360, "http:// OR https:// ONLY!", NEON_RED)
+
+    def _toggle_music(self):
+        playing = self.audio.toggle_music()
+        self.music_btn.set_text("MUSIC ON" if playing else "MUSIC OFF")
 
     def _dec_concurrent(self):
         self._set_concurrent(self.manager.max_concurrent - 1)
@@ -864,60 +760,47 @@ class DownloaderApp:
         self._set_concurrent(self.manager.max_concurrent + 1)
 
     def _set_concurrent(self, value):
-        value = max(1, min(8, value))
-        self.manager.max_concurrent = value
-        self.concurrent_label.config(text=str(value))
-        self._update_status_bar()
+        self.manager.max_concurrent = max(1, min(8, value))
 
-    def _add_urls(self):
-        folder = self.folder_var.get().strip()
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning(
-                "Bad Folder", "Please select a valid save folder first."
-            )
-            return
+    def _on_wheel(self, event):
+        total = len(self.manager.tasks) * (CARD_H + CARD_GAP)
+        view = QUEUE_BOTTOM - QUEUE_TOP
+        self.scroll = max(0, min(max(0, total - view), self.scroll - event.delta // 2))
 
-        raw = self.url_text.get("1.0", tk.END)
-        urls = [u.strip() for u in raw.split() if u.strip()]
-        if not urls:
-            messagebox.showwarning("Missing URL", "Please enter at least one URL.")
-            return
+    def _on_press(self, event):
+        x, y = event.x, event.y
+        for b in self.buttons:
+            if b.contains(x, y):
+                b.press()
+                return
+        for x1, y1, x2, y2, task in reversed(self.card_rects):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                if task.item_id in self.selected:
+                    self.selected.discard(task.item_id)
+                else:
+                    self.selected.add(task.item_id)
 
-        added = 0
-        for url in urls:
-            if not (url.startswith("http://") or url.startswith("https://")):
-                continue
-            filename = self._extract_filename(url) or "download"
-            output_path = self._unique_output_path(folder, filename)
-            task = DownloadTask(url, folder, output_path)
-            self.manager.add(task)
+    def _on_release(self, event):
+        for b in self.buttons:
+            if b.contains(event.x, event.y):
+                b.release()
+                b.invoke()
+                return
+            b.release()
 
-            iid = self.tree.insert(
-                "", tk.END, values=self._row_values(task),
-                tags=self._tags_for(task),
-            )
-            task.item_id = iid
-            self.tasks_by_iid[iid] = task
-            added += 1
+    def _on_motion(self, event):
+        for b in self.buttons:
+            b.hover = b.contains(event.x, event.y)
 
-        if added == 0:
-            messagebox.showwarning(
-                "No valid URLs", "URLs must start with http:// or https://"
-            )
-            return
-
-        self.url_text.delete("1.0", tk.END)
-        self._refresh_all_rows()
+    # -- selection operations -----------------------------------------
+    def _selected_tasks(self):
+        return [t for t in self.manager.tasks if t.item_id in self.selected]
 
     def _remove_selected(self):
-        for iid in list(self.tree.selection()):
-            task = self.tasks_by_iid.get(iid)
-            if task is None:
-                continue
+        for task in self._selected_tasks():
             if task.state in ("downloading", "queued"):
                 task.cancel_flag = True
                 task.status = "Cancelling..."
-                self._refresh_row(task)
                 with self.manager.lock:
                     if task in self.manager.pending:
                         self.manager.pending.remove(task)
@@ -928,23 +811,15 @@ class DownloaderApp:
                 with self.manager.lock:
                     if task in self.manager.tasks:
                         self.manager.tasks.remove(task)
-                self.tasks_by_iid.pop(iid, None)
-                try:
-                    self.tree.delete(iid)
-                except Exception:
-                    pass
-        self._refresh_all_rows()
+                self.tasks_by_iid.pop(task.item_id, None)
+        self.selected.clear()
+        self.audio.sfx("click")
 
     def _move_selected(self, delta):
-        """Move selected rows up (-1) or down (+1) in the queue."""
-        selection = list(self.tree.selection())
-        if not selection:
+        selected = self._selected_tasks()
+        if not selected:
             return
-        selected = [
-            self.tasks_by_iid[i] for i in selection if i in self.tasks_by_iid
-        ]
         tasks = self.manager.tasks
-
         if delta < 0:
             for task in sorted(selected, key=tasks.index):
                 i = tasks.index(task)
@@ -955,145 +830,291 @@ class DownloaderApp:
                 i = tasks.index(task)
                 if i < len(tasks) - 1 and tasks[i + 1] not in selected:
                     tasks[i + 1], tasks[i] = tasks[i], tasks[i + 1]
-
         with self.manager.lock:
             self.manager._reorder_pending()
-        self._sync_tree_order()
-        self._refresh_all_rows()
-        self.tree.selection_set(selection)
+        self.audio.sfx("click")
 
     def _set_priority(self, value):
-        """Set priority on all selected rows (0=High, 1=Normal, 2=Low)."""
-        selection = list(self.tree.selection())
-        if not selection:
-            return
-        for iid in selection:
-            task = self.tasks_by_iid.get(iid)
-            if task is not None:
-                task.priority = value
-                self._refresh_row(task)
+        for task in self._selected_tasks():
+            task.priority = value
         with self.manager.lock:
             self.manager._reorder_pending()
-        self._update_priority_controls()
+        self.audio.sfx("click")
 
-    def _update_priority_controls(self, event=None):
-        selection = list(self.tree.selection())
-        selected = [
-            self.tasks_by_iid[i] for i in selection if i in self.tasks_by_iid
-        ]
-        prios = {t.priority for t in selected}
-        active = prios.pop() if len(prios) == 1 else None
-        for value, btn in self.priority_buttons.items():
-            btn.set_selected(value == active)
+    def _delete_row(self, iid):
+        self.tasks_by_iid.pop(iid, None)
+        self.selected.discard(iid)
 
-    def _sync_tree_order(self):
-        """Reorder treeview rows to match the queue/list order."""
-        for index, task in enumerate(self.manager.tasks):
-            if task.item_id is None:
-                continue
-            try:
-                if self.tree.exists(task.item_id):
-                    self.tree.move(task.item_id, "", index)
-            except Exception:
-                pass
-
-    def _on_close(self):
-        self.manager.cancel_all()
-        self.root.destroy()
-
-    def _on_batch_done(self):
-        self._update_status_bar()
-
-    # ------------------------------------------------------------------
-    # Row rendering (main thread only)
-    # ------------------------------------------------------------------
-    def _tags_for(self, task):
-        try:
-            index = self.manager.tasks.index(task)
-        except ValueError:
-            index = 0
-        return (task.state, "band1" if index % 2 else "band0")
-
-    def _row_values(self, task):
-        if task.total > 0:
-            size = (
-                f"{self._human_size(task.downloaded)} / "
-                f"{self._human_size(task.total)}"
-            )
-            pct = min(100.0, (task.downloaded / task.total) * 100)
-            progress = f"{self._bar(pct)} {pct:3.0f}%"
-        else:
-            size = self._human_size(task.downloaded) if task.downloaded else "-"
-            progress = "—"
-
-        if task.state == "downloading" and task.speed > 0:
-            speed = f"{self._human_size(task.speed)}/s"
-        else:
-            speed = ""
-
-        name = task.filename or task.url
-        priority = PRIORITY_LABELS.get(task.priority, "Normal")
-        return (priority, name, size, progress, speed, task.status)
-
+    # -- engine callbacks (mostly no-ops: we render every frame) -------
     def _refresh_row(self, task):
-        if task.item_id is None:
-            return
-        try:
-            if not self.tree.exists(task.item_id):
-                return
-        except Exception:
-            return
-        try:
-            self.tree.item(
-                task.item_id,
-                values=self._row_values(task),
-                tags=self._tags_for(task),
-            )
-        except Exception:
-            pass
-        self._update_status_bar()
+        pass
 
     def _refresh_all_rows(self):
-        for task in self.manager.tasks:
-            self._refresh_row(task)
-        self._update_status_bar()
+        pass
 
     def _update_status_bar(self):
-        counts = {"queued": 0, "downloading": 0, "complete": 0, "failed": 0,
-                  "cancelled": 0}
-        for t in self.manager.tasks:
-            counts[t.state] = counts.get(t.state, 0) + 1
-        parts = []
-        if counts["downloading"]:
-            parts.append(
-                f"{counts['downloading']}/{self.manager.max_concurrent} active"
-            )
-        if counts["queued"]:
-            parts.append(f"{counts['queued']} queued")
-        if counts["complete"]:
-            parts.append(f"{counts['complete']} complete")
-        if counts["failed"]:
-            parts.append(f"{counts['failed']} failed")
-        if counts["cancelled"]:
-            parts.append(f"{counts['cancelled']} cancelled")
-        self.status_var.set("  ·  ".join(parts) if parts else "Ready.")
+        pass
 
-        if counts["failed"]:
-            color = RED
-        elif counts["downloading"]:
-            color = ACCENT
-        elif counts["complete"] and not counts["queued"]:
-            color = GREEN
+    def _on_batch_done(self):
+        self._popup(512, 300, "ALL DONE! AWESOME!", NEON_GREEN)
+
+    def _on_complete(self, task):
+        self.combo += 1
+        mb = max(1, task.total // (1024 * 1024))
+        gained = mb * 5 * self.combo
+        self.score += gained
+        self.audio.sfx("complete")
+        self._popup(512, 300 + random.randint(-30, 30),
+                    f"DOWNLOADED! +{gained}  COMBO x{self.combo}", NEON_GREEN)
+        self._burst(random.randint(200, 800), random.randint(300, 550))
+        roll = random.random()
+        if roll < 0.02:
+            self._jumpscare()
+        elif roll < 0.07:
+            self.cantaloupe_until = time.time() + 4.0
+            self._popup(512, 400, "🍈 CANTALOUPE OBTAINED! +1000", NEON_ORANGE)
+            self.score += 1000
+
+    def _jumpscare(self):
+        self.scare_until = time.time() + 0.8
+        self.shake_until = time.time() + 0.6
+        self.combo = 0
+        self.audio.sfx("jumpscare")
+
+    def _burst(self, x, y):
+        for _ in range(26):
+            ang = random.uniform(0, math.tau)
+            spd = random.uniform(2, 7)
+            self.particles.append({
+                "x": x, "y": y,
+                "vx": math.cos(ang) * spd, "vy": math.sin(ang) * spd - 2,
+                "life": random.uniform(0.6, 1.2),
+                "color": random.choice((NEON_PINK, NEON_CYAN, NEON_GREEN,
+                                        NEON_YELLOW)),
+            })
+
+    def _popup(self, x, y, text, color):
+        self.popups.append({
+            "x": x, "y": y, "text": text, "color": color, "life": 1.6,
+        })
+
+    # -- rendering loop ------------------------------------------------
+    def _tick(self):
+        now = time.time()
+        self._draw_background(now)
+        self._draw_hud(now)
+        self._draw_cards(now)
+        self._draw_popups(now)
+        self._draw_particles(now)
+        self._draw_scare(now)
+        self._draw_cantaloupe(now)
+        self._apply_shake(now)
+        c = self.stage
+        c.tag_raise("cards")
+        c.tag_raise("ui")
+        c.tag_raise("popups")
+        c.tag_raise("scare")
+        c.tag_raise("widgets")
+        self.root.after(33, self._tick)
+
+    def _draw_background(self, now):
+        c = self.stage
+        c.delete("bg")
+        # starfield
+        for s in self.stars:
+            s[1] += s[2]
+            if s[1] > 720:
+                s[1] = 0
+                s[0] = random.uniform(0, 1024)
+            c.create_oval(s[0], s[1], s[0] + 2, s[1] + 2, outline="",
+                          fill=s[3], tags="bg")
+        # scrolling neon horizon grid
+        off = (now * 60) % 40
+        for i in range(-1, 19):
+            y = 720 - i * 40 + off
+            shade = NEON_PURPLE if i % 2 == 0 else "#3a1e7a"
+            c.create_line(0, y, 1024, y, fill=shade, tags="bg")
+        for x in range(0, 1025, 64):
+            c.create_line(512, 430, x, 720, fill="#2b1560", tags="bg")
+        # title + tagline (color-cycling)
+        self.title_hue = (self.title_hue + 4) % 360
+        color = self._hsv(self.title_hue, 1.0, 1.0)
+        c.create_text(512, 58, text="AWESOME DOWNLOADER",
+                      fill=color, font=(TITLE_FONT, 40, "bold"), tags="bg")
+        c.create_text(512, 98,
+                      text="DOWNLOAD... LIKE A BOSS!!!!!",
+                      fill=NEON_CYAN, font=(FONT, 12, "bold"), tags="bg")
+        # input frame
+        c.create_rectangle(30, 138, 762, 190, outline=NEON_PURPLE, width=2,
+                           tags="bg")
+        c.create_text(38, 128, text="URL", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+        c.create_rectangle(24, 620, 1004, 710, outline=NEON_PURPLE, width=2,
+                           tags="bg")
+        c.create_text(34, 636, text="SAVE TO", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+        c.create_text(34, 684, text="CONCURRENT", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+        c.create_text(200, 683, text=str(self.manager.max_concurrent),
+                      fill=NEON_PURPLE, font=(FONT, 13, "bold"), tags="bg")
+        c.create_text(24, 216, text="DOWNLOAD QUEUE", anchor="w",
+                      fill=NEON_CYAN, font=(FONT, 11, "bold"), tags="bg")
+        c.create_text(716, 218, text="PRIORITY", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+
+    def _draw_hud(self, now):
+        c = self.stage
+        c.delete("hud")
+        active = sum(1 for t in self.manager.tasks if t.state == "downloading")
+        queued = sum(1 for t in self.manager.tasks if t.state == "queued")
+        c.create_text(1000, 26, text=f"SCORE {self.score}", anchor="ne",
+                      fill=NEON_YELLOW, font=(FONT, 14, "bold"), tags="hud")
+        c.create_text(1000, 50, text=f"COMBO x{self.combo}", anchor="ne",
+                      fill=NEON_PINK, font=(FONT, 11, "bold"), tags="hud")
+        c.create_text(1000, 72,
+                      text=f"{active}/{self.manager.max_concurrent} ACTIVE  "
+                           f"{queued} QUEUED",
+                      anchor="ne", fill=FG_DIM, font=(FONT, 9), tags="hud")
+
+    def _draw_cards(self, now):
+        c = self.stage
+        c.delete("cards")
+        self.card_rects = []
+        y = QUEUE_TOP - self.scroll
+        for task in self.manager.tasks:
+            if y + CARD_H >= QUEUE_TOP - 20 and y <= QUEUE_BOTTOM + 20:
+                self._draw_card(task, 20, y, 984, CARD_H, now)
+                self.card_rects.append((20, y, 1004, y + CARD_H, task))
+            y += CARD_H + CARD_GAP
+
+    def _draw_card(self, task, x, y, w, h, now):
+        c = self.stage
+        color = self._state_color(task.state)
+        selected = task.item_id in self.selected
+        outline = NEON_YELLOW if selected else color
+        c.create_rectangle(x, y, x + w, y + h, outline=outline,
+                           width=3 if selected else 2, fill=CARD, tags="cards")
+        c.create_text(x + 14, y + 18, text=task.filename, anchor="w",
+                      fill=FG, font=(FONT, 11, "bold"), tags="cards")
+        info = (
+            f"{PRIORITY_LABELS.get(task.priority, 'NORMAL')}  |  "
+            f"{self._human_size(task.downloaded)} / "
+            f"{self._human_size(task.total) if task.total else '??'}  |  "
+            f"{self._human_size(task.speed)}/s  |  {task.status}"
+        )
+        c.create_text(x + 14, y + 38, text=info, anchor="w", fill=FG_DIM,
+                      font=(FONT, 9), tags="cards")
+        bx1, by1, bx2, by2 = x + 14, y + h - 13, x + w - 14, y + h - 5
+        c.create_rectangle(bx1, by1, bx2, by2, outline=BORDER, fill=DARK,
+                           tags="cards")
+        if task.total > 0:
+            pct = max(0.0, min(1.0, task.downloaded / task.total))
+        elif task.state in ("complete",):
+            pct = 1.0
         else:
-            color = FG_DIM
-        try:
-            self.status_dot.itemconfig(self._dot, fill=color)
-        except Exception:
-            pass
+            pct = 0.0
+        fill_w = (bx2 - bx1) * pct
+        if fill_w > 1:
+            c.create_rectangle(bx1, by1, bx1 + fill_w, by2, outline="",
+                               fill=color, tags="cards")
+            if task.state == "downloading":
+                sx = bx1 + ((now * 260) % max(1.0, fill_w))
+                c.create_rectangle(sx, by1, min(sx + 14, bx1 + fill_w), by2,
+                                   outline="", fill="#ffffff", tags="cards")
+        c.create_text(bx2, y + 18, text=f"{int(pct * 100):3d}%", anchor="e",
+                      fill=color, font=(FONT, 11, "bold"), tags="cards")
 
-    # ------------------------------------------------------------------
-    # Naming helpers
-    # ------------------------------------------------------------------
+    def _draw_popups(self, now):
+        c = self.stage
+        c.delete("popups")
+        alive = []
+        for p in self.popups:
+            p["life"] -= 0.033
+            p["y"] -= 0.7
+            if p["life"] > 0:
+                alive.append(p)
+                c.create_text(p["x"], p["y"], text=p["text"], fill=p["color"],
+                              font=(FONT, 15, "bold"), tags="popups")
+        self.popups = alive
+
+    def _draw_particles(self, now):
+        c = self.stage
+        c.delete("particles")
+        alive = []
+        for p in self.particles:
+            p["life"] -= 0.033
+            if p["life"] <= 0:
+                continue
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["vy"] += 0.25
+            alive.append(p)
+            c.create_oval(p["x"], p["y"], p["x"] + 4, p["y"] + 4, outline="",
+                          fill=p["color"], tags="particles")
+        self.particles = alive
+
+    def _draw_scare(self, now):
+        c = self.stage
+        c.delete("scare")
+        if now >= self.scare_until:
+            return
+        c.create_rectangle(0, 0, 1024, 720, outline="", fill="#3a0000",
+                           tags="scare")
+        jitter = random.randint(-8, 8)
+        c.create_oval(300 + jitter, 200, 440, 340, fill="#ffffff",
+                      outline=NEON_RED, width=4, tags="scare")
+        c.create_oval(560 + jitter, 200, 700, 340, fill="#ffffff",
+                      outline=NEON_RED, width=4, tags="scare")
+        c.create_oval(350 + jitter, 250, 390, 290, fill="#000000", outline="",
+                      tags="scare")
+        c.create_oval(610 + jitter, 250, 650, 290, fill="#000000", outline="",
+                      tags="scare")
+        c.create_text(512, 460, text="R U N", fill=NEON_RED,
+                      font=(TITLE_FONT, 60, "bold"), tags="scare")
+
+    def _draw_cantaloupe(self, now):
+        c = self.stage
+        c.delete("melon")
+        if now >= self.cantaloupe_until:
+            return
+        cx, cy = 512, 300
+        c.create_oval(cx - 90, cy - 70, cx + 90, cy + 70, fill="#8fce4a",
+                      outline="#4a7a1e", width=3, tags="melon")
+        for dx in (-45, 0, 45):
+            c.create_arc(cx + dx - 30, cy - 70, cx + dx + 30, cy + 70,
+                         start=250, extent=40, style=tk.ARC, outline="#4a7a1e",
+                         width=3, tags="melon")
+        c.create_text(cx, cy + 110, text="🍈 CANTALOUPE! +1000",
+                      fill=NEON_ORANGE, font=(FONT, 16, "bold"), tags="melon")
+
+    def _apply_shake(self, now):
+        if now < self.shake_until:
+            dx = random.randint(-6, 6)
+            dy = random.randint(-6, 6)
+            self.root.geometry(f"+{80 + dx}+{40 + dy}")
+        else:
+            self.root.geometry("+80+40")
+
+    # -- helpers -------------------------------------------------------
+    @staticmethod
+    def _hsv(h, s, v):
+        i = int(h // 60) % 6
+        f = (h / 60) - int(h / 60)
+        p, q, t = v * (1 - s), v * (1 - s * f), v * (1 - s * (1 - f))
+        rgb = [(v, t, p), (q, v, p), (p, v, t),
+               (p, q, v), (t, p, v), (v, p, q)][i]
+        return "#%02x%02x%02x" % tuple(int(c * 255) for c in rgb)
+
+    @staticmethod
+    def _state_color(state):
+        return {
+            "queued": NEON_CYAN,
+            "downloading": NEON_PINK,
+            "complete": NEON_GREEN,
+            "failed": NEON_RED,
+            "cancelled": NEON_ORANGE,
+        }.get(state, FG)
+
     def _unique_output_path(self, folder, filename, exclude=None):
         base, ext = os.path.splitext(filename)
         existing = {
@@ -1119,36 +1140,42 @@ class DownloaderApp:
         return name.strip() or None
 
     @staticmethod
-    def _bar(pct, width=16):
-        filled = int(round(width * pct / 100))
-        filled = max(0, min(width, filled))
-        return "█" * filled + "░" * (width - filled)
-
-    @staticmethod
     def _human_size(num_bytes):
         for unit in ("B", "KB", "MB", "GB", "TB"):
             if abs(num_bytes) < 1024:
-                return f"{num_bytes:.1f} {unit}"
+                return f"{num_bytes:.1f}{unit}"
             num_bytes /= 1024
-        return f"{num_bytes:.1f} PB"
+        return f"{num_bytes:.1f}PB"
 
     @staticmethod
     def _fmt_time(seconds):
         if seconds < 60:
             return f"{seconds:.0f}s"
         if seconds < 3600:
-            return f"{seconds // 60:.0f}m {seconds % 60:.0f}s"
+            return f"{seconds // 60:.0f}m{seconds % 60:.0f}s"
         h = seconds // 3600
         m = (seconds % 3600) // 60
-        return f"{h:.0f}h {m:.0f}m"
+        return f"{h:.0f}h{m:.0f}m"
+
+    def _on_close(self):
+        self.manager.cancel_all()
+        self.audio.stop_music()
+        self.root.destroy()
 
 
-# ----------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------
+def _muted_audio():
+    class _Muted:
+        enabled = False
+        def start_music(self): pass
+        def stop_music(self): pass
+        def toggle_music(self): return False
+        def sfx(self, name): pass
+    return _Muted()
+
+
 def main():
     root = tk.Tk()
-    app = DownloaderApp(root)
+    AwesomeDownloader(root)
     root.mainloop()
 
 
