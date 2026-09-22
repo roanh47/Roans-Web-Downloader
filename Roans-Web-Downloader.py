@@ -609,6 +609,8 @@ class AwesomeDownloader:
         self.card_rects = []
         self.title_hue = 0.0
         self.shake_until = 0.0
+        self._shake_active = False
+        self._shake_base = (80, 40)
         self.scare_until = 0.0
         self.cantaloupe_until = 0.0
         self.combo = 0
@@ -635,6 +637,7 @@ class AwesomeDownloader:
     # -- construction --------------------------------------------------
     def _build(self):
         c = self.stage
+        self._build_background()
 
         # URL entry (embedded widget)
         self.url_var = tk.StringVar()
@@ -654,8 +657,8 @@ class AwesomeDownloader:
             insertbackground=NEON_PINK, relief="flat", font=(FONT, 10),
             highlightthickness=0,
         )
-        c.create_window(140, 630, window=self.folder_entry, anchor="nw",
-                        width=450, height=24, tags=("widgets",))
+        c.create_window(130, 628, window=self.folder_entry, anchor="nw",
+                        width=470, height=28, tags=("widgets",))
 
         # Buttons
         self.buttons = [
@@ -663,7 +666,7 @@ class AwesomeDownloader:
                          self._add_urls, NEON_PINK, 14, accent=True),
             ArcadeButton(self, 896, 140, 112, 48, "MUSIC ON",
                          self._toggle_music, NEON_YELLOW, 10),
-            ArcadeButton(self, 610, 620, 110, 38, "BROWSE",
+            ArcadeButton(self, 614, 626, 110, 32, "BROWSE",
                          self._pick_folder, NEON_GREEN, 10),
         ]
         # queue toolbar
@@ -680,23 +683,63 @@ class AwesomeDownloader:
                          lambda: self._set_priority(2), NEON_GREEN, 10),
         ]
         # concurrent stepper
-        self.minus_btn = ArcadeButton(self, 150, 668, 34, 30, "-",
+        self.minus_btn = ArcadeButton(self, 150, 670, 34, 30, "-",
                                       self._dec_concurrent, NEON_PURPLE, 14)
-        self.plus_btn = ArcadeButton(self, 216, 668, 34, 30, "+",
+        self.plus_btn = ArcadeButton(self, 216, 670, 34, 30, "+",
                                      self._inc_concurrent, NEON_PURPLE, 14)
         self.buttons += [self.minus_btn, self.plus_btn]
         # bottom actions
         self.buttons += [
-            ArcadeButton(self, 300, 666, 100, 34, "REMOVE",
+            ArcadeButton(self, 300, 670, 100, 30, "REMOVE",
                          self._remove_selected, NEON_CYAN, 10),
-            ArcadeButton(self, 410, 666, 130, 34, "CLEAR DONE",
+            ArcadeButton(self, 410, 670, 130, 30, "CLEAR DONE",
                          self.manager.clear_finished, NEON_CYAN, 10),
-            ArcadeButton(self, 550, 666, 120, 34, "CANCEL ALL",
+            ArcadeButton(self, 550, 670, 120, 30, "CANCEL ALL",
                          self.manager.cancel_all, NEON_ORANGE, 10),
-            ArcadeButton(self, 790, 662, 214, 42, "START!",
+            ArcadeButton(self, 790, 664, 214, 42, "START!",
                          self.manager.start_all, NEON_GREEN, 16, accent=True),
         ]
         self.music_btn = self.buttons[1]
+
+    def _build_background(self):
+        """Static background items drawn once, animated in place."""
+        c = self.stage
+        self.star_items = [
+            c.create_oval(s[0], s[1], s[0] + 2, s[1] + 2, fill=s[3],
+                          outline="", tags="bg")
+            for s in self.stars
+        ]
+        self.grid_spacing = 34
+        self.grid_lines = [
+            c.create_line(0, 0, 1024, 0, fill=NEON_PURPLE, tags="bg")
+            for _ in range(24)
+        ]
+        for x in range(0, 1025, 64):
+            c.create_line(512, 430, x, 720, fill="#2b1560", tags="bg")
+        self.title_item = c.create_text(
+            512, 58, text="AWESOME DOWNLOADER", fill=NEON_PINK,
+            font=(TITLE_FONT, 40, "bold"), tags="bg",
+        )
+        c.create_text(512, 98, text="DOWNLOAD... LIKE A BOSS!!!!!",
+                      fill=NEON_CYAN, font=(FONT, 12, "bold"), tags="bg")
+        c.create_rectangle(30, 138, 762, 190, outline=NEON_PURPLE, width=2,
+                           tags="bg")
+        c.create_text(38, 128, text="URL", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+        c.create_rectangle(24, 618, 1004, 712, outline=NEON_PURPLE, width=2,
+                           tags="bg")
+        c.create_text(34, 642, text="SAVE TO", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+        c.create_text(34, 685, text="CONCURRENT", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
+        self.concurrent_item = c.create_text(
+            200, 685, text=str(self.manager.max_concurrent), fill=NEON_PURPLE,
+            font=(FONT, 13, "bold"), tags="bg",
+        )
+        c.create_text(24, 216, text="DOWNLOAD QUEUE", anchor="w",
+                      fill=NEON_CYAN, font=(FONT, 11, "bold"), tags="bg")
+        c.create_text(716, 218, text="PRIORITY", anchor="w", fill=FG_DIM,
+                      font=(FONT, 9, "bold"), tags="bg")
 
     def _bind_events(self):
         self.stage.bind("<Button-1>", self._on_press)
@@ -761,6 +804,9 @@ class AwesomeDownloader:
 
     def _set_concurrent(self, value):
         self.manager.max_concurrent = max(1, min(8, value))
+        self.stage.itemconfig(
+            self.concurrent_item, text=str(self.manager.max_concurrent)
+        )
 
     def _on_wheel(self, event):
         total = len(self.manager.tasks) * (CARD_H + CARD_GAP)
@@ -878,6 +924,8 @@ class AwesomeDownloader:
     def _jumpscare(self):
         self.scare_until = time.time() + 0.8
         self.shake_until = time.time() + 0.6
+        self._shake_base = (self.root.winfo_x(), self.root.winfo_y())
+        self._shake_active = True
         self.combo = 0
         self.audio.sfx("jumpscare")
 
@@ -915,52 +963,25 @@ class AwesomeDownloader:
         c.tag_raise("popups")
         c.tag_raise("scare")
         c.tag_raise("widgets")
-        self.root.after(33, self._tick)
+        self.root.after(16, self._tick)
 
     def _draw_background(self, now):
         c = self.stage
-        c.delete("bg")
-        # starfield
-        for s in self.stars:
+        # starfield (move existing items, no flicker)
+        for i, s in enumerate(self.stars):
             s[1] += s[2]
             if s[1] > 720:
                 s[1] = 0
                 s[0] = random.uniform(0, 1024)
-            c.create_oval(s[0], s[1], s[0] + 2, s[1] + 2, outline="",
-                          fill=s[3], tags="bg")
-        # scrolling neon horizon grid
-        off = (now * 60) % 40
-        for i in range(-1, 19):
-            y = 720 - i * 40 + off
-            shade = NEON_PURPLE if i % 2 == 0 else "#3a1e7a"
-            c.create_line(0, y, 1024, y, fill=shade, tags="bg")
-        for x in range(0, 1025, 64):
-            c.create_line(512, 430, x, 720, fill="#2b1560", tags="bg")
-        # title + tagline (color-cycling)
-        self.title_hue = (self.title_hue + 4) % 360
-        color = self._hsv(self.title_hue, 1.0, 1.0)
-        c.create_text(512, 58, text="AWESOME DOWNLOADER",
-                      fill=color, font=(TITLE_FONT, 40, "bold"), tags="bg")
-        c.create_text(512, 98,
-                      text="DOWNLOAD... LIKE A BOSS!!!!!",
-                      fill=NEON_CYAN, font=(FONT, 12, "bold"), tags="bg")
-        # input frame
-        c.create_rectangle(30, 138, 762, 190, outline=NEON_PURPLE, width=2,
-                           tags="bg")
-        c.create_text(38, 128, text="URL", anchor="w", fill=FG_DIM,
-                      font=(FONT, 9, "bold"), tags="bg")
-        c.create_rectangle(24, 620, 1004, 710, outline=NEON_PURPLE, width=2,
-                           tags="bg")
-        c.create_text(34, 636, text="SAVE TO", anchor="w", fill=FG_DIM,
-                      font=(FONT, 9, "bold"), tags="bg")
-        c.create_text(34, 684, text="CONCURRENT", anchor="w", fill=FG_DIM,
-                      font=(FONT, 9, "bold"), tags="bg")
-        c.create_text(200, 683, text=str(self.manager.max_concurrent),
-                      fill=NEON_PURPLE, font=(FONT, 13, "bold"), tags="bg")
-        c.create_text(24, 216, text="DOWNLOAD QUEUE", anchor="w",
-                      fill=NEON_CYAN, font=(FONT, 11, "bold"), tags="bg")
-        c.create_text(716, 218, text="PRIORITY", anchor="w", fill=FG_DIM,
-                      font=(FONT, 9, "bold"), tags="bg")
+            c.coords(self.star_items[i], s[0], s[1], s[0] + 2, s[1] + 2)
+        # smooth time-based scrolling horizon grid (updates coords in place)
+        offset = (now * 90) % self.grid_spacing
+        for i, item in enumerate(self.grid_lines):
+            y = 720 - i * self.grid_spacing + offset
+            c.coords(item, 0, y, 1024, y)
+        # color-cycling title
+        self.title_hue = (self.title_hue + 2.5) % 360
+        c.itemconfig(self.title_item, fill=self._hsv(self.title_hue, 1.0, 1.0))
 
     def _draw_hud(self, now):
         c = self.stage
@@ -1088,12 +1109,17 @@ class AwesomeDownloader:
                       fill=NEON_ORANGE, font=(FONT, 16, "bold"), tags="melon")
 
     def _apply_shake(self, now):
+        # Only touch the window geometry while shaking, then restore once.
+        # Otherwise the window is free to be moved by the user.
         if now < self.shake_until:
-            dx = random.randint(-6, 6)
-            dy = random.randint(-6, 6)
-            self.root.geometry(f"+{80 + dx}+{40 + dy}")
-        else:
-            self.root.geometry("+80+40")
+            bx, by = self._shake_base
+            self.root.geometry(
+                f"+{bx + random.randint(-6, 6)}+{by + random.randint(-6, 6)}"
+            )
+        elif self._shake_active:
+            bx, by = self._shake_base
+            self.root.geometry(f"+{bx}+{by}")
+            self._shake_active = False
 
     # -- helpers -------------------------------------------------------
     @staticmethod
